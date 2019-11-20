@@ -59,7 +59,9 @@ parser.add_argument('--arch', '-a', metavar='ARCH', default='resnet18',
                     help='model architecture: ' +
                         ' | '.join(model_names) +
                         ' (default: resnet18)')
-parser.add_argument('-j', '--workers', default=4, type=int, metavar='N',
+parser.add_argument('--model_dir', default='saved_models', dest='model_dir',
+                    help='where to save models')
+parser.add_argument('-j', '--workers', default=2, type=int, metavar='N',
                     help='number of data loading workers (default: 4)')
 parser.add_argument('--epochs', default=130, type=int, metavar='N',
                     help='number of total epochs to run')
@@ -415,7 +417,7 @@ def train(model, optimizer, criteria, epochs, train_loader, val_loader,
                 'optimizer' : optimizer.state_dict(),
                 'progress_table' : progress_table,
                 'stats': stats
-            }, False, 'models', save_filename)
+            }, False, args.model_dir, save_filename)
 
             if args.write_pure_model:
                 torch.save(to_save.encoder.state_dict(),args.arch+'.encoder.pth.tar')
