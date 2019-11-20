@@ -422,11 +422,13 @@ def train(model, optimizer, criteria, epochs, train_loader, val_loader,
             if args.write_pure_model:
                 torch.save(to_save.encoder.state_dict(),args.arch+'.encoder.pth.tar')
             if is_best:
-                save_checkpoint(None, True,'models', save_filename)
+                save_checkpoint(None, True,args.model_dir, save_filename)
             if args.fp16:
                 to_save = network_to_half(to_save)
         except:
             print('save checkpoint failed...')
+            if args.fp16:
+                to_save = network_to_half(to_save)
 
 
 
