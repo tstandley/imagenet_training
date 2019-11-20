@@ -115,7 +115,7 @@ parser.add_argument('--world-size', default=1, type=int,
 #                     help='Used for multi-process training. Can either be manually set ' +
 #                     'or automatically set by using \'python -m multiproc\'.')
 
-cudnn.benchmark = True
+#cudnn.benchmark = True
 def fast_collate(batch):
     imgs = [img[0] for img in batch]
     targets = torch.tensor([target[1] for target in batch], dtype=torch.int64)
