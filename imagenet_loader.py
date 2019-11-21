@@ -98,6 +98,10 @@ class ImageFolder(data.Dataset):
 
     def __init__(self, root, transform=None, target_transform=None,
                  loader=default_loader, class_to_idx_seed=None):
+        if ',' in root:
+            root,root2=root.split(',')
+        else:
+            root2=root
         if class_to_idx_seed is None:
             classes, class_to_idx = find_classes(root)
         else:
@@ -115,6 +119,7 @@ class ImageFolder(data.Dataset):
                                "Supported image extensions are: " + ",".join(IMG_EXTENSIONS)))
 
         self.root = root
+        self.root2=root2
         self.imgs = imgs
         self.classes = classes
         self.class_to_idx = class_to_idx
@@ -135,12 +140,17 @@ class ImageFolder(data.Dataset):
         img = 0
         while img==0:
             try:
-                memname = fname.replace(self.root,'/run/shm/')
-                if not os.path.isfile(memname):
-                    path = fname
-                else:
-                    path = memname
-                img = self.loader(path)
+                # memname = fname.replace(self.root,'/run/shm/')
+                # if not os.path.isfile(memname):
+                #     path = fname
+                # else:
+                #     path = memname
+
+                if bool(random.getrandbits(1)):
+                    fname=fname.replace(self.root,self.root2)
+
+                img = self.loader(fname)
+                
             except:
                 img = 0
                 fname, target = random.choice(self.imgs)
