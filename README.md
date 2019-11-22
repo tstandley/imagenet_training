@@ -14,5 +14,5 @@ conda install -c conda-forge libjpeg-turbo
 
 usage example:
 ```
-python3 train_imagenet.py -t /imagenet_data/train/ -v  /imagenet_data/val/ -a xception -b 256 -j=2 --fp16
+CUDA_VISIBLE_DEVICES=1,0 python3 train_imagenet.py -t /imagenet_data/train/ -v  /imagenet_data/val/ -a xception -b 256 -j=6 -n=my_experiment_name --lr=.1 -o=O1
 ```
