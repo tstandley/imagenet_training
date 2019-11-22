@@ -59,7 +59,7 @@ parser.add_argument('-b', '--batch-size', default=64, type=int,
                     help='mini-batch size (default: 64)')
 parser.add_argument('--model_dir', default='saved_models', dest='model_dir',
                     help='where to save models')
-parser.add_argument('--image-size', default=224, type=int, metavar='N',
+parser.add_argument('-s','--image-size', default=224, type=int, metavar='N',
                     help='size of image side (images are square)')
 parser.add_argument('-j', '--workers', default=2, type=int, metavar='N',
                     help='number of data loading workers (default: 4)')
@@ -97,10 +97,11 @@ parser.add_argument('--dist-url', default='file://sync.file', type=str,
 parser.add_argument('--dist-backend', default='nccl', type=str,
                     help='distributed backend')
 
-parser.add_argument('-o','--opt-level', default='O0',type=str)
-parser.add_argument('--keep-batchnorm-fp32', type=str, default=None)
-parser.add_argument('--sync_bn', action='store_true',
-                    help='enabling apex sync BN.')
+parser.add_argument('-alrs','--alternate-learning-rate-schedule',action='store_true',
+                    help='Use alternate learning rate schedule with learning rate warmup?')
+
+parser.add_argument('-fp16','--fp16',action='store_true',
+                    help='use amp fp16 (O1)')
 
 cudnn.benchmark = True
 def fast_collate(batch):
@@ -133,9 +134,6 @@ def main(args):
     valdir=args.val
 
 
-    args.fp16=(args.opt_level in ['o1','O1','o2','O2'])
-    if args.fp16:
-        print('Got fp16')
 
 
     train_transforms = [
@@ -175,13 +173,6 @@ def main(args):
 
     print("Model has", get_n_params(model), "parameters")
 
-    if args.sync_bn:
-        import apex
-        print("using apex synced BN")
-        model = apex.parallel.convert_syncbn_model(model)
-
-
-
     model = model.cuda()
 
     optimizer = torch.optim.SGD(model.parameters(), args.lr,
@@ -190,11 +181,13 @@ def main(args):
 
     # Initialize Amp.  Amp accepts either values or strings for the optional override arguments,
     # for convenient interoperation with argparse.
-    model, optimizer = amp.initialize(model, optimizer,
-                                      opt_level=args.opt_level,
-                                      keep_batchnorm_fp32=args.keep_batchnorm_fp32,
-                                      loss_scale="dynamic"
-                                      )
+    if args.fp16:
+        model, optimizer = amp.initialize(model, optimizer,
+                                        opt_level='O1',
+                                        loss_scale="dynamic",
+                                        verbosity=0
+                                        )
+        print('Got fp16!')
 
     args.lr = args.lr*float(args.batch_size*args.virtual_batch_multiplier)/256.
 
@@ -266,11 +259,11 @@ def main(args):
     validation_sets = [val_loader]
 
     trainer=Trainer(train_loader,val_loader,model,optimizer,criteria,args,checkpoint)
-    if args.validate:
-        trainer.progress_table=[]
-        trainer.validate([{}])
-        print()
-        return
+    # if args.validate:
+    #     trainer.progress_table=[]
+    #     trainer.validate([{}])
+    #     print()
+    #     return
     
 
     trainer.train()
@@ -441,6 +434,8 @@ class Trainer:
         self.fp16=args.fp16
         self.code_archive=self.get_code_archive()
         if checkpoint:
+            print()
+            print()
             self.progress_table = checkpoint['progress_table']
             self.start_epoch = checkpoint['epoch']+1
             self.best_prec5 = checkpoint['best_prec5']
@@ -470,13 +465,11 @@ class Trainer:
         return file_contents
 
     def train(self):
-        
-        print()
-        print()
-
-
         for self.epoch in range(self.start_epoch,self.args.epochs):
-            self.adjust_learning_rate()
+            if self.args.alternate_learning_rate_schedule:
+                self.adjust_learning_rate2()
+            else:
+                self.adjust_learning_rate()
 
             # train for one epoch
             train_string, train_stats = self.train_epoch()
@@ -656,8 +649,11 @@ class Trainer:
         loss = loss_dict[first_loss].clone()
         loss = loss / self.args.virtual_batch_multiplier
             
-        with amp.scale_loss(loss, self.optimizer) as scaled_loss:
-            scaled_loss.backward()
+        if self.args.fp16:
+            with amp.scale_loss(loss, self.optimizer) as scaled_loss:
+                scaled_loss.backward()
+        else:
+            loss.backward()
 
         return loss_dict, loss
 
@@ -734,6 +730,44 @@ class Trainer:
             self.set_learning_rate(self.lr0*.1)
             return
         self.set_learning_rate(self.lr0*.01)
+    def adjust_learning_rate2(self):
+        """Use learning rate warmup and then decrease by half every jump to lr0/512@55 epochs"""
+        if self.epoch == 0:
+            self.set_learning_rate(self.lr0/16)
+        elif self.epoch == 1:
+            self.set_learning_rate(self.lr0/8)
+        elif self.epoch == 2:
+            self.set_learning_rate(self.lr0/4)
+        elif self.epoch == 3:
+            self.set_learning_rate(self.lr0/2)
+        elif self.epoch == 4:
+            self.set_learning_rate(self.lr0/1.5)
+        elif self.epoch == 5:
+            self.set_learning_rate(self.lr0)
+        elif self.epoch == 6:
+            self.set_learning_rate(self.lr0*1.5)
+        elif self.epoch < 8:
+            self.set_learning_rate(self.lr0*2)
+        elif self.epoch < 12:
+            self.set_learning_rate(self.lr0)
+        elif self.epoch < 15:
+            self.set_learning_rate(self.lr0/2)
+        elif self.epoch < 20:
+            self.set_learning_rate(self.lr0/4)
+        elif self.epoch < 25:
+            self.set_learning_rate(self.lr0/8)
+        elif self.epoch < 30:
+            self.set_learning_rate(self.lr0/16)
+        elif self.epoch < 35:
+            self.set_learning_rate(self.lr0/32)
+        elif self.epoch < 40:
+            self.set_learning_rate(self.lr0/64)
+        elif self.epoch < 55:
+            self.set_learning_rate(self.lr0/128)
+        elif self.epoch < 58:
+            self.set_learning_rate(self.lr0/256)
+        else:
+            self.set_learning_rate(self.lr0/512)
 
     def set_learning_rate(self,lr):
         for param_group in self.optimizer.param_groups:
