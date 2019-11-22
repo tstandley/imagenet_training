@@ -126,6 +126,21 @@ def main(args):
     print('starting on', platform.node())
     if 'CUDA_VISIBLE_DEVICES' in os.environ:
         print('cuda gpus:',os.environ['CUDA_VISIBLE_DEVICES'])
+    args.distributed = False
+    if 'WORLD_SIZE' in os.environ:
+        args.distributed = int(os.environ['WORLD_SIZE']) > 1
+
+
+    args.gpu = 0
+    args.world_size = 1
+
+    if args.distributed:
+        args.gpu = args.local_rank
+        torch.cuda.set_device(args.gpu)
+        torch.distributed.init_process_group(backend='nccl',
+                                             init_method='env://')
+        args.world_size = torch.distributed.get_world_size()
+
     
     main_stream = torch.cuda.Stream()
 
@@ -183,6 +198,14 @@ def main(args):
 
 
     model = model.cuda()
+    if args.distributed:
+        # By default, apex.parallel.DistributedDataParallel overlaps communication with 
+        # computation in the backward pass.
+        # model = DDP(model)
+        # delay_allreduce delays all communication to the end of the backward pass.
+        model = DDP(model, delay_allreduce=True)
+
+    model = model.cuda()
 
     optimizer = torch.optim.SGD(model.parameters(), args.lr,
                                 momentum=args.momentum,
@@ -196,7 +219,7 @@ def main(args):
                                       loss_scale="dynamic"
                                       )
 
-    args.lr = args.lr*float(args.batch_size*args.virtual_batch_multiplier)/256.
+    args.lr = args.lr*float(args.batch_size*args.world_size)/256.
 
     # optionally resume from a checkpoint
     checkpoint=None
@@ -224,11 +247,11 @@ def main(args):
             print("=> no checkpoint found at '{}'".format(args.resume))
 
 
-    if torch.cuda.device_count() >1:
-        print('got device count:',torch.cuda.device_count())
-        model = torch.nn.DataParallel(model).cuda()
+    # if torch.cuda.device_count() >1:
+    #     print('got device count:',torch.cuda.device_count())
+    #     model = torch.nn.DataParallel(model).cuda()
 
-    print('Virtual batch size =', args.batch_size*args.virtual_batch_multiplier)
+    print('Virtual batch size =', args.batch_size*args.virtual_batch_multiplier*args.world_size)
 
     # define loss function (criterion) and optimizer
     criteria = []
@@ -247,25 +270,36 @@ def main(args):
                 correct_k = correct[:k].view(-1).float().sum(0, keepdim=True)
                 res.append(correct_k.mul_(100.0 / batch_size))
             return res
-    def top5(output,target):
-        return float(accuracy(output, target, topk=(5,))[0])
-    def top1(output,target):
-        return float(accuracy(output, target, topk=(1,))[0])
-    criteria.append({"CL":lambda output,target:nn.CrossEntropyLoss().cuda()(output,target).float(),"top1":top1,"top5":top5})
+    def top5(output,target,distributed = args.distributed):
+        prec5 = accuracy(output, target, topk=(5,))[0]
+        if args.distributed:
+            prec5=reduce_tensor(prec5)
+        return prec5.float()
 
+    def top1(output,target,distributed = args.distributed):
+        prec1 = accuracy(output, target, topk=(1,))[0]
+        if args.distributed:
+            prec1=reduce_tensor(prec1)
+        return prec1.float()
+    criteria.append({"CL":lambda output,target:nn.CrossEntropyLoss().cuda()(output,target).float(),"top1":top1,"top5":top5})
     
     if args.resume:
         if os.path.isfile(args.resume):
             optimizer.load_state_dict(checkpoint['optimizer'])
 
+
+    train_sampler = None
+    if args.distributed:
+        train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
+
     train_loader = torch.utils.data.DataLoader(
-        train_dataset, batch_size=args.batch_size, shuffle=True,
-        num_workers=args.workers, pin_memory=True, sampler=None, collate_fn=fast_collate)
+        train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),
+        num_workers=args.workers, pin_memory=True, sampler=train_sampler, collate_fn=fast_collate)
 
     val_loader = get_val_loader(None, args.val, train_dataset, args)
     validation_sets = [val_loader]
 
-    trainer=Trainer(train_loader,val_loader,model,optimizer,criteria,args,checkpoint)
+    trainer=Trainer(train_loader,val_loader,model,optimizer,criteria,args,train_sampler,checkpoint)
     if args.validate:
         trainer.progress_table=[]
         trainer.validate([{}])
@@ -306,10 +340,14 @@ def get_val_loader(normalize, valdir, train_dataset, args):
         val_dataset = imagenet_loader.ImageFolder(valdir, transforms.Compose(val_transforms))
     print('Found',len(val_dataset),'validation instances.')
     
+    val_sampler = None
+    if args.distributed:
+        val_sampler = torch.utils.data.distributed.DistributedSampler(val_dataset)
+
     val_loader = torch.utils.data.DataLoader(
         val_dataset,
         batch_size=max(args.batch_size//2,1), shuffle=False,
-        num_workers=args.workers, pin_memory=True,sampler=None, collate_fn=fast_collate)
+        num_workers=args.workers, pin_memory=True,sampler=val_sampler, collate_fn=fast_collate)
     return val_loader
 
 
@@ -430,8 +468,9 @@ class AverageMeter(object):
 
 
 class Trainer:
-    def __init__(self,train_loader,val_loader,model,optimizer,criteria,args,checkpoint=None):
+    def __init__(self,train_loader,val_loader,model,optimizer,criteria,args,train_sampler,checkpoint=None):
         self.train_loader=train_loader
+        self.train_sampler=train_sampler
         self.val_loader=val_loader
         self.train_prefetcher=data_prefetcher(self.train_loader)
         self.model=model
@@ -456,7 +495,8 @@ class Trainer:
 
         #self.lr0 = get_average_learning_rate(optimizer)
         self.lr0 = self.args.lr
-        print_table(self.progress_table,False)
+        if args.local_rank == 0:
+            print_table(self.progress_table,False)
         self.ticks=0
         self.last_tick=0
         #self.loss_tracking_window = args.loss_tracking_window_initial
@@ -476,6 +516,8 @@ class Trainer:
 
 
         for self.epoch in range(self.start_epoch,self.args.epochs):
+            if args.distributed:
+                self.train_sampler.set_epoch(self.epoch)
             self.adjust_learning_rate()
 
             # train for one epoch
@@ -521,6 +563,7 @@ class Trainer:
                 torch.save(to_save.encoder.state_dict(),args.arch+'.encoder.pth.tar')
             if is_best:
                 self.save_checkpoint(None, True,self.args.model_dir, save_filename)
+
         except:
             print('save checkpoint failed...')
 
@@ -587,6 +630,8 @@ class Trainer:
             
             # do the weight updates and set gradients back to zero
             self.update()
+            if args.distributed:
+                reduced_loss = reduce_tensor(loss.data).float()
 
             self.loss_history.append(float(loss))
 
@@ -619,7 +664,8 @@ class Trainer:
                     to_print[name]= ('{meter.avg:.4g}').format(meter=meter)
                 if batch_num < num_data_points-1:
                     to_print['ETA']= ('{0}').format(time.strftime("%H:%M:%S", time.gmtime(int(eta+elapsed_time_for_epoch))))
-                print_table(self.progress_table+[[to_print]])
+                if args.local_rank == 0:
+                    print_table(self.progress_table+[[to_print]])
                 
 
         
@@ -643,6 +689,10 @@ class Trainer:
     def train_batch(self, input, target):
 
         loss_dict = {}
+        
+        # if self.args.fp16:
+        #     input = input.float().half()
+        # else:
         
         input = input.float()
         output = self.model(input)
@@ -683,6 +733,9 @@ class Trainer:
 
                 if batch_num ==0:
                     epoch_start_time2=time.time()
+                #if self.args.fp16:
+                #    input = input.float().half()
+                #else:
                 input = input.float()
                 output = self.model(input)
                 
@@ -708,7 +761,8 @@ class Trainer:
                     meter = average_meters[name]
                     to_print[name]= ('{meter.avg:.4g}').format(meter=meter)
                 progress=train_table+[to_print]
-                print_table(self.progress_table+[progress])
+                if args.local_rank == 0:
+                    print_table(self.progress_table+[progress])
 
         epoch_time = time.time()-epoch_start_time
 
@@ -738,6 +792,13 @@ class Trainer:
     def set_learning_rate(self,lr):
         for param_group in self.optimizer.param_groups:
             param_group['lr'] = lr
+
+
+def reduce_tensor(tensor):
+    rt = tensor.clone()
+    dist.all_reduce(rt, op=dist.reduce_op.SUM)
+    rt /= args.world_size
+    return rt
 
 if __name__ == '__main__':
     #mp.set_start_method('forkserver')
