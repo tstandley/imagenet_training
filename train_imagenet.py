@@ -97,6 +97,8 @@ parser.add_argument('--dist-url', default='file://sync.file', type=str,
 parser.add_argument('--dist-backend', default='nccl', type=str,
                     help='distributed backend')
 
+parser.add_argument('-cl','--channels-last','--channels_last', action='store_true',
+                    help='Channels last is a new pytorch memory format and it is supposed to be faster')
 parser.add_argument('-alrs','--alternate-learning-rate-schedule',action='store_true',
                     help='Use alternate learning rate schedule with learning rate warmup?')
 
@@ -104,6 +106,10 @@ parser.add_argument('-fp16','--fp16',action='store_true',
                     help='use amp fp16 (O1)')
 
 cudnn.benchmark = True
+
+
+
+
 def fast_collate(batch):
     imgs = [img[0] for img in batch]
     targets = torch.tensor([target[1] for target in batch], dtype=torch.int64)
@@ -133,9 +139,10 @@ def main(args):
     traindir=args.train
     valdir=args.val
 
-
-
-
+    if args.channels_last:
+        memory_format = torch.channels_last
+    else:
+        memory_format = torch.contiguous_format
     train_transforms = [
         transforms.RandomResizedCrop(args.image_size),
         transforms.RandomHorizontalFlip(),
@@ -173,7 +180,8 @@ def main(args):
 
     print("Model has", get_n_params(model), "parameters")
 
-    model = model.cuda()
+    model = model.cuda().to(memory_format=memory_format)
+    
 
     optimizer = torch.optim.SGD(model.parameters(), args.lr,
                                 momentum=args.momentum,
@@ -259,11 +267,11 @@ def main(args):
     validation_sets = [val_loader]
 
     trainer=Trainer(train_loader,val_loader,model,optimizer,criteria,args,checkpoint)
-    # if args.validate:
-    #     trainer.progress_table=[]
-    #     trainer.validate([{}])
-    #     print()
-    #     return
+    if args.validate:
+        trainer.progress_table=[]
+        trainer.validate([{}])
+        print()
+        return
     
 
     trainer.train()
@@ -326,10 +334,13 @@ def get_average_learning_rate(optimizer):
 
 
 class data_prefetcher():
-    def __init__(self, loader):
+    def __init__(self, loader, memory_format=torch.contiguous_format):
         self.inital_loader = loader
+        self.memory_format=memory_format
         self.loader = iter(loader)
         self.stream = torch.cuda.Stream()
+        self.mean = torch.tensor([0.485 * 255, 0.456 * 255, 0.406 * 255]).cuda().view(1,3,1,1)
+        self.std = torch.tensor([0.229 * 255, 0.224 * 255, 0.225 * 255]).cuda().view(1,3,1,1)
         self.preload()
 
     def preload(self):
@@ -343,6 +354,8 @@ class data_prefetcher():
             return
         with torch.cuda.stream(self.stream):
             self.next_input = self.next_input.cuda(non_blocking=True)
+            self.next_input = self.next_input.float()
+            self.next_input = self.next_input.sub_(self.mean).div_(self.std).to(memory_format=self.memory_format)
             self.next_target = self.next_target.cuda(non_blocking=True)
 
     def next(self):
