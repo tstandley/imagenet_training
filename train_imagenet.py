@@ -227,7 +227,7 @@ def main(args):
 
     if torch.cuda.device_count() >1:
         print('got device count:',torch.cuda.device_count())
-        model = torch.nn.DataParallel(model).cuda()
+        model = torch.nn.DataParallel(model).cuda().to(memory_format=memory_format)
 
     print('Virtual batch size =', args.batch_size*args.virtual_batch_multiplier)
 
