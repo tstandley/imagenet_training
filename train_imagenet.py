@@ -113,6 +113,9 @@ parser.add_argument('-fp16','--fp16',action='store_true',
 parser.add_argument('-ebn', '--eliminate_batchnorm', action='store_true',
                     help='roll all batchnorm layers into their preceeding conv2d.')
 
+parser.add_argument('-sbn', '--sync_batch_norm', action='store_true',
+                    help='sync batch norm parameters accross gpus.')
+
 cudnn.benchmark = True
 
 
@@ -245,7 +248,8 @@ def main_worker(gpu, ngpus, args, port=0):
     torch.cuda.set_device(gpu)
     model = model.cuda(gpu).to(memory_format=memory_format)
     if ngpus > 1:
-        model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
+        if args.sync_batch_norm:
+            model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
         model = torch.nn.parallel.DistributedDataParallel(model,device_ids=[gpu],find_unused_parameters=True).to(memory_format=memory_format)
         
     optimizer = torch.optim.SGD(model.parameters(), args.lr,
