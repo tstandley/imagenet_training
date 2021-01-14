@@ -17,16 +17,20 @@ import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 
 
-import imagenet_loader
+import imagenet_loader_old as imagenet_loader
+
+import torch.multiprocessing as mp
+
+import random
 
 
-try:
-    from apex.parallel import DistributedDataParallel as DDP
-    from apex.fp16_utils import *
-    from apex import amp, optimizers
-    from apex.multi_tensor_apply import multi_tensor_applier
-except ImportError:
-    raise ImportError("Please install apex from https://www.github.com/nvidia/apex to run this example.")
+# try:
+#     from apex.parallel import DistributedDataParallel as DDP
+#     from apex.fp16_utils import *
+#     from apex import amp, optimizers
+#     from apex.multi_tensor_apply import multi_tensor_applier
+# except ImportError:
+#     raise ImportError("Please install apex from https://www.github.com/nvidia/apex to run this example.")
 
 import copy
 import numpy as np
@@ -65,9 +69,10 @@ parser.add_argument('-j', '--workers', default=2, type=int, metavar='N',
                     help='number of data loading workers (default: 4)')
 parser.add_argument('--epochs', default=90, type=int, metavar='N',
                     help='number of total epochs to run')
+parser.add_argument('-limit','--limit','--batch_limit_per_epoch',dest='batch_limit_per_epoch', default=0, type=int,
+                    help='batches per epoch. 0 means full dataset')
 
-
-parser.add_argument('--start-epoch', default=0, type=int, metavar='N',
+parser.add_argument('--start-epoch', default=-1, type=int, metavar='N',
                     help='manual epoch number (useful on restarts)')
 parser.add_argument('-lr','--lr', '--learning-rate', default=0.1, type=float,
                     metavar='LR', help='initial learning rate')
@@ -105,6 +110,9 @@ parser.add_argument('-alrs','--alternate-learning-rate-schedule',action='store_t
 parser.add_argument('-fp16','--fp16',action='store_true',
                     help='use amp fp16 (O1)')
 
+parser.add_argument('-ebn', '--eliminate_batchnorm', action='store_true',
+                    help='roll all batchnorm layers into their preceeding conv2d.')
+
 cudnn.benchmark = True
 
 
@@ -127,14 +135,41 @@ def fast_collate(batch):
         
     return tensor, targets
 
-
 def main(args):
+    
+    ngpus = torch.cuda.device_count()
+    if ngpus>1:
+        port=random.randint(49152,65535)
+        mp.spawn(start_workers, nprocs=ngpus, args=(ngpus, args, port))
+    else:
+        main_worker(0, ngpus, args)
+
+def start_workers(gpu, ngpus, args,port):
+    print(gpu, ngpus)
+
+    if gpu==0:
+        main_worker(gpu,ngpus,args,port)
+    else:
+        sys.stdout = open(os.devnull, "w")
+        main_worker(gpu,ngpus,args,port)
+        sys.stdout = sys.__stdout__
+
+
+def main_worker(gpu, ngpus, args, port=0):
     print(args)
+
+    args.batch_size=args.batch_size//ngpus
+
+
+    if ngpus > 1:
+        torch.distributed.init_process_group(backend='nccl', init_method='tcp://127.0.0.1:'+str(port),world_size=ngpus,rank=gpu)
+
+
     print('starting on', platform.node())
     if 'CUDA_VISIBLE_DEVICES' in os.environ:
         print('cuda gpus:',os.environ['CUDA_VISIBLE_DEVICES'])
     
-    main_stream = torch.cuda.Stream()
+    #main_stream = torch.cuda.Stream()
 
     traindir=args.train
     valdir=args.val
@@ -143,6 +178,7 @@ def main(args):
         memory_format = torch.channels_last
     else:
         memory_format = torch.contiguous_format
+
     train_transforms = [
         transforms.RandomResizedCrop(args.image_size),
         transforms.RandomHorizontalFlip(),
@@ -164,9 +200,6 @@ def main(args):
         print("=> creating model '{}'".format(args.arch))
         model = models.__dict__[args.arch](num_classes=len(train_dataset.classes))
 
-
-
-
     def get_n_params(model):
         pp=0
         for p in list(model.parameters()):
@@ -180,24 +213,8 @@ def main(args):
 
     print("Model has", get_n_params(model), "parameters")
 
-    model = model.cuda().to(memory_format=memory_format)
     
-
-    optimizer = torch.optim.SGD(model.parameters(), args.lr,
-                                momentum=args.momentum,
-                                weight_decay=args.weight_decay)
-
-    # Initialize Amp.  Amp accepts either values or strings for the optional override arguments,
-    # for convenient interoperation with argparse.
-    if args.fp16:
-        model, optimizer = amp.initialize(model, optimizer,
-                                        opt_level='O1',
-                                        loss_scale="dynamic",
-                                        verbosity=0
-                                        )
-        print('Got fp16!')
-
-    args.lr = args.lr*float(args.batch_size*args.virtual_batch_multiplier)/256.
+    args.lr = args.lr*float(args.batch_size*ngpus*args.virtual_batch_multiplier)/256.
 
     # optionally resume from a checkpoint
     checkpoint=None
@@ -225,9 +242,19 @@ def main(args):
             print("=> no checkpoint found at '{}'".format(args.resume))
 
 
-    if torch.cuda.device_count() >1:
-        print('got device count:',torch.cuda.device_count())
-        model = torch.nn.DataParallel(model).cuda().to(memory_format=memory_format)
+    torch.cuda.set_device(gpu)
+    model = model.cuda(gpu).to(memory_format=memory_format)
+    if ngpus > 1:
+        model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
+        model = torch.nn.parallel.DistributedDataParallel(model,device_ids=[gpu],find_unused_parameters=True).to(memory_format=memory_format)
+        
+    optimizer = torch.optim.SGD(model.parameters(), args.lr,
+                                momentum=args.momentum,
+                                weight_decay=args.weight_decay)
+    if args.eliminate_batchnorm:
+        from eliminate_batchnorm import eliminate_batchnorm
+        print('eliminating batchnorm')
+        eliminate_batchnorm(model)
 
     print('Virtual batch size =', args.batch_size*args.virtual_batch_multiplier)
 
@@ -245,13 +272,13 @@ def main(args):
 
             res = []
             for k in topk:
-                correct_k = correct[:k].view(-1).float().sum(0, keepdim=True)
+                correct_k = correct[:k].contiguous().view(-1).float().sum(0, keepdim=True) 
                 res.append(correct_k.mul_(100.0 / batch_size))
             return res
     def top5(output,target):
-        return float(accuracy(output, target, topk=(5,))[0])
+        return accuracy(output, target, topk=(5,))[0]
     def top1(output,target):
-        return float(accuracy(output, target, topk=(1,))[0])
+        return accuracy(output, target, topk=(1,))[0]
     criteria.append({"CL":lambda output,target:nn.CrossEntropyLoss().cuda()(output,target).float(),"top1":top1,"top5":top5})
 
     
@@ -259,14 +286,23 @@ def main(args):
         if os.path.isfile(args.resume):
             optimizer.load_state_dict(checkpoint['optimizer'])
 
-    train_loader = torch.utils.data.DataLoader(
-        train_dataset, batch_size=args.batch_size, shuffle=True,
-        num_workers=args.workers, pin_memory=True, sampler=None, collate_fn=fast_collate)
 
-    val_loader = get_val_loader(None, args.val, train_dataset, args)
+    if ngpus>1:
+        train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
+    else:
+        train_sampler = None
+
+
+    train_loader = torch.utils.data.DataLoader(
+        train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),
+        num_workers=args.workers, pin_memory=True, sampler=train_sampler, collate_fn=fast_collate)
+
+
+    val_loader = get_val_loader(None, args.val, train_dataset, args, ngpus)
     validation_sets = [val_loader]
 
-    trainer=Trainer(train_loader,val_loader,model,optimizer,criteria,args,checkpoint)
+    trainer=Trainer(train_loader,val_loader,model,optimizer,criteria,args,checkpoint,rank=gpu,ngpus=ngpus)
+
     if args.validate:
         trainer.progress_table=[]
         trainer.validate([{}])
@@ -277,7 +313,7 @@ def main(args):
     trainer.train()
    
 
-def get_val_loader(normalize, valdir, train_dataset, args):
+def get_val_loader(normalize, valdir, train_dataset, args, ngpus):
 
     print(valdir)
     if args.image_size == 299:
@@ -302,15 +338,20 @@ def get_val_loader(normalize, valdir, train_dataset, args):
             #normalize,
         ]
     if train_dataset is not None:
-        val_dataset = imagenet_loader.ImageFolder(valdir, transforms.Compose(val_transforms), class_to_idx_seed=train_dataset.class_to_idx)
+        val_dataset = imagenet_loader.ImageFolder(valdir, transforms.Compose(val_transforms))
     else:
         val_dataset = imagenet_loader.ImageFolder(valdir, transforms.Compose(val_transforms))
     print('Found',len(val_dataset),'validation instances.')
+
+    if ngpus>1:
+        val_sampler = torch.utils.data.distributed.DistributedSampler(val_dataset)
+    else:
+        val_sampler = None
     
     val_loader = torch.utils.data.DataLoader(
         val_dataset,
-        batch_size=max(args.batch_size//2,1), shuffle=False,
-        num_workers=args.workers, pin_memory=True,sampler=None, collate_fn=fast_collate)
+        batch_size=args.batch_size, shuffle=False,
+        num_workers=args.workers, pin_memory=True,sampler=val_sampler, collate_fn=fast_collate)
     return val_loader
 
 
@@ -426,6 +467,8 @@ class AverageMeter(object):
         self.lst = []
 
     def update(self, val, n=1):
+        if math.isnan(val):
+            return
         self.val = float(val)
         self.sum += float(val) * n
         #self.sumsq += float(val)**2
@@ -436,22 +479,33 @@ class AverageMeter(object):
 
 
 class Trainer:
-    def __init__(self,train_loader,val_loader,model,optimizer,criteria,args,checkpoint=None):
+    def __init__(self,train_loader,val_loader,model,optimizer,criteria,args,checkpoint=None,rank=0,ngpus=0):
+        self.rank=rank
+        self.ngpus=ngpus
         self.train_loader=train_loader
         self.val_loader=val_loader
-        self.train_prefetcher=data_prefetcher(self.train_loader)
+        if args.channels_last:
+            self.memory_format = torch.channels_last
+            print('got channels_last')
+        else:
+            self.memory_format = torch.contiguous_format
+        self.train_prefetcher=data_prefetcher(self.train_loader,memory_format=self.memory_format)
         self.model=model
         self.optimizer=optimizer
         self.criteria=criteria
         self.args = args
         self.fp16=args.fp16
         self.code_archive=self.get_code_archive()
+        if self.fp16:
+            self.scaler = torch.cuda.amp.GradScaler()
         if checkpoint:
             print()
             print()
             self.progress_table = checkpoint['progress_table']
             self.start_epoch = checkpoint['epoch']+1
-            self.best_prec5 = checkpoint['best_prec5']
+            if args.start_epoch !=-1:
+                self.start_epoch=args.start_epoch
+            self.best_prec5 = checkpoint['best_prec5'] 
             self.stats = checkpoint['stats']
             self.loss_history = checkpoint['loss_history']
         else:
@@ -490,7 +544,7 @@ class Trainer:
             # evaluate on validation set
             progress_string=train_string
             prec5, progress_string, val_stats = self.validate(progress_string)
-            print()
+            #print()
 
             self.progress_table.append(progress_string)
 
@@ -498,6 +552,8 @@ class Trainer:
             self.checkpoint(prec5)
 
     def checkpoint(self, prec5):
+        if self.rank!=0:
+            return
         is_best = prec5 > self.best_prec5
         self.best_prec5 = max(prec5, self.best_prec5)
         save_filename = self.args.experiment_name+'_'+self.args.arch+'_'+('p' if self.args.pretrained != '' else 'np')+'_checkpoint.pth.tar'
@@ -561,6 +617,8 @@ class Trainer:
 
         batch_num = 0
         num_data_points=len(self.train_loader)//self.args.virtual_batch_multiplier
+        if self.args.batch_limit_per_epoch > 0:
+            num_data_points = self.args.batch_limit_per_epoch
         #num_data_points//=10
         starting_learning_rate=get_average_learning_rate(self.optimizer)
         while True:
@@ -615,6 +673,7 @@ class Trainer:
 
                 to_print = {}
                 to_print['ep']= ('{0}:').format(self.epoch)
+                to_print['%']=('{0:2.1f}').format(100*batch_num/num_data_points)
                 to_print['#/{0}'.format(num_data_points)]= ('{0}').format(batch_num)
                 to_print['lr']= ('{0:0.3g}').format(get_average_learning_rate(self.optimizer))
                 to_print['eta']= ('{0}').format(time.strftime("%H:%M:%S", time.gmtime(int(eta))))
@@ -650,30 +709,46 @@ class Trainer:
 
         loss_dict = {}
         
+        self.optimizer.zero_grad(set_to_none=True)
         input = input.float()
-        output = self.model(input)
-
-        for i, criterion in enumerate(self.criteria):
+        
+        with torch.cuda.amp.autocast(enabled = self.args.fp16):
+            output = self.model(input)
             first_loss=None
-            for c_name,criterion_fun in criterion.items():
-                if first_loss is None:first_loss=c_name
-                loss_dict[c_name]=criterion_fun(output, target)
+            for criterion in self.criteria:
+                for c_name,criterion_fun in criterion.items():
+                    if first_loss is None:first_loss=c_name
+                    loss_dict[c_name]=criterion_fun(output, target)
 
-        loss = loss_dict[first_loss].clone()
-        loss = loss / self.args.virtual_batch_multiplier
+            loss = loss_dict[first_loss].clone()
+            loss = loss / self.args.virtual_batch_multiplier
+                
             
-        if self.args.fp16:
-            with amp.scale_loss(loss, self.optimizer) as scaled_loss:
-                scaled_loss.backward()
-        else:
-            loss.backward()
+            if self.args.fp16:
+                self.scaler.scale(loss).backward()
+            else:
+                loss.backward()
 
+        
+
+        if self.ngpus > 1:
+            loss = self.reduce(loss)
+            loss_dict= {k:self.reduce(v) for k,v in loss_dict.items()}
         return loss_dict, loss
 
     
+    def reduce(self,tensor):
+        tensor = tensor.detach().clone()
+        torch.distributed.all_reduce(tensor)
+        tensor/=self.ngpus
+        return tensor
+    
     def update(self):
-        self.optimizer.step()
-        self.optimizer.zero_grad()
+        if self.args.fp16:
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+        else:
+            self.optimizer.step()
 
 
     def validate(self, train_table):
@@ -683,8 +758,7 @@ class Trainer:
         batch_num=0
         num_data_points=len(self.val_loader)
 
-        prefetcher = data_prefetcher(self.val_loader)
-        torch.cuda.empty_cache()
+        prefetcher = data_prefetcher(self.val_loader,memory_format=self.memory_format)
         with torch.no_grad():
             for i in range(len(self.val_loader)):
                 input, target = prefetcher.next()
@@ -692,15 +766,24 @@ class Trainer:
 
                 if batch_num ==0:
                     epoch_start_time2=time.time()
-                input = input.float()
-                output = self.model(input)
+                
+                
+                with torch.cuda.amp.autocast(enabled = self.args.fp16):
+                    output = self.model(input)
+                
                 
 
                 loss_dict = {}
                 for criterion in self.criteria:
                     for c_name,criterion_fun in criterion.items():
                         loss_dict[c_name]=criterion_fun(output, target)
+
+
                 
+                if self.ngpus > 1:
+                    loss_dict= {k:self.reduce(v) for k,v in loss_dict.items()}
+
+
                 batch_num=i+1
 
                 for name,value in loss_dict.items():    
@@ -711,6 +794,7 @@ class Trainer:
                 eta = ((time.time()-epoch_start_time2)/(batch_num+.2))*(len(self.val_loader)-batch_num)
 
                 to_print = {}
+                to_print['%']=('{0:2.1f}').format(100*batch_num/num_data_points)
                 to_print['#/{0}'.format(num_data_points)]= ('{0}').format(batch_num)
                 to_print['eta']= ('{0}').format(time.strftime("%H:%M:%S", time.gmtime(int(eta))))
                 for name in criterion.keys():
@@ -730,19 +814,28 @@ class Trainer:
             stats[name]=meter.avg
         self.prec5 = stats['top5']
         to_print['eta']= ('{0}').format(time.strftime("%H:%M:%S", time.gmtime(int(epoch_time))))
-        torch.cuda.empty_cache()
+        #torch.cuda.empty_cache()
         return float(self.prec5), progress , stats
 
 
     def adjust_learning_rate(self):
         """Sets the learning rate to the initial LR decayed by 10 every 30 epochs"""
-        if self.epoch < 30:
-            self.set_learning_rate(self.lr0)
-            return
-        if self.epoch < 60:
+        if self.epoch < 1:
             self.set_learning_rate(self.lr0*.1)
             return
-        self.set_learning_rate(self.lr0*.01)
+        if self.epoch < 25:
+            self.set_learning_rate(self.lr0)
+            return
+        if self.epoch < 50:
+            self.set_learning_rate(self.lr0*.1)
+            return
+        if self.epoch < 75:
+            self.set_learning_rate(self.lr0*.01)
+            return
+        if self.epoch < 120:
+            self.set_learning_rate(self.lr0*.001)
+            return
+        self.set_learning_rate(self.lr0*.0001)
     def adjust_learning_rate2(self):
         """Use learning rate warmup and then decrease by half every jump to lr0/512@55 epochs"""
         if self.epoch == 0:
